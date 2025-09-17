@@ -49,6 +49,8 @@ services:
       # - OPENAI_API_KEY=ollama
       # - OPENAI_MODEL=orieg/gemma3-tools:1b
       #-  MUNDI_EMBED_ALLOWED_ORIGINS=http://localhost:4321
+      # extra_hosts:
+      #   - "host.docker.internal:host-gateway"
     command: uvicorn src.wsgi:app --host 0.0.0.0 --port 8000 --log-level debug --access-log --use-colors
     volumes:
       - ./src:/app/src
@@ -57,13 +59,16 @@ services:
       - ./docs:/app/docs
 
   minio:
-    image: bitnami/minio:latest
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     environment:
       - MINIO_ROOT_USER=admin
       - MINIO_ROOT_PASSWORD=password
-      - MINIO_DEFAULT_BUCKETS=test-bucket
     volumes:
       - ./data/minio:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -79,6 +84,7 @@ services:
     entrypoint: >
       /bin/sh -c "
       /usr/bin/mc alias set myminio http://minio:9000 admin password;
+      /usr/bin/mc mb myminio/test-bucket --ignore-existing;
       /usr/bin/mc admin user add myminio s3user backup123;
       /usr/bin/mc admin policy attach myminio readwrite --user s3user ||
       (sleep 3 && /usr/bin/mc admin policy attach myminio readwrite --user s3user);
