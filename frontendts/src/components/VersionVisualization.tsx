@@ -10,6 +10,7 @@ import {
   MapPlus,
   MessageCirclePlus,
   Minus,
+  SquareTerminal,
   TextSearch,
   Upload,
   User,
@@ -51,6 +52,8 @@ function iconForToolCall(toolCall: SanitizedToolCall) {
       return <ZoomIn className="w-4 h-4" />;
     case 'qgis':
       return <QgisIcon className="w-4 h-4" />;
+    case 'square-terminal':
+      return <SquareTerminal className="w-4 h-4" />;
   }
 }
 
@@ -85,11 +88,13 @@ function MessageItem({
   const toolColorLookup: Record<string, string> = {
     success: 'text-muted-foreground',
     error: 'text-red-400',
+    pending: 'text-gray-300',
   };
 
   const toolHoverColorLookup: Record<string, string> = {
     success: 'hover:text-gray-100',
     error: 'hover:text-red-300',
+    pending: 'hover:text-gray-100',
   };
 
   return (
@@ -98,65 +103,70 @@ function MessageItem({
         key={msgIndex}
         className={`text-halfway-sm-xs ${message.role === 'user' ? 'rounded bg-gray-700 text-right py-0.5 px-2 max-w-3/4 ml-auto' : ''}`}
       >
-        <div className="flex-1 min-w-0 text-white">
+        <div className="flex-1 min-w-0 text-white [&_img]:border [&_img]:border-[#aaa] [&_img]:rounded-md [&_img]:my-2 [&_img]:block [&_img]:mx-auto [&_img]:max-w-[360px] [&_img]:h-auto [&_pre]:max-w-80 [&_pre]:overflow-x-scroll [&_pre]:my-4 [&_pre]:bg-gray-900 [&_pre]:border-gray-500 [&_pre]:border [&_pre]:rounded">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
         </div>
       </div>
       {message.tool_calls && message.tool_calls.length > 0 && (
         <div>
-          {message.tool_calls.map((toolCall) => (
-            <div key={toolCall.id} className="space-y-1">
-              <div
-                className={`flex justify-start gap-2 ${toolColorLookup[toolStatusLookup[toolCall.id]]} ${isExpandable(toolCall) ? `cursor-pointer ${toolHoverColorLookup[toolStatusLookup[toolCall.id]]}` : ''}`}
-                onClick={() => {
-                  if (isExpandable(toolCall)) {
-                    const isExpanded = expandedToolCalls.includes(toolCall.id);
-                    if (isExpanded) {
-                      setExpandedToolCalls(expandedToolCalls.filter((id) => id !== toolCall.id));
-                    } else {
-                      setExpandedToolCalls([...expandedToolCalls, toolCall.id]);
+          {message.tool_calls.map((toolCall) => {
+            const status = toolStatusLookup[toolCall.id] ?? 'pending';
+            return (
+              <div key={toolCall.id} className="space-y-1">
+                <div
+                  className={`flex justify-start gap-2 ${toolColorLookup[status]} ${
+                    status === 'pending' ? 'animate-pulse' : ''
+                  } ${isExpandable(toolCall) ? `cursor-pointer ${toolHoverColorLookup[status]}` : ''}`}
+                  onClick={() => {
+                    if (isExpandable(toolCall)) {
+                      const isExpanded = expandedToolCalls.includes(toolCall.id);
+                      if (isExpanded) {
+                        setExpandedToolCalls(expandedToolCalls.filter((id) => id !== toolCall.id));
+                      } else {
+                        setExpandedToolCalls([...expandedToolCalls, toolCall.id]);
+                      }
                     }
-                  }
-                }}
-                title={toolStatusLookup[toolCall.id] === 'error' ? 'Tool call failed' : 'Tool call succeeded'}
-              >
-                <div>{iconForToolCall(toolCall)}</div>
-                <div>{toolCall.tagline}</div>
-                {isExpandable(toolCall) && (
+                  }}
+                  title={status === 'error' ? 'Tool call failed' : status === 'pending' ? 'Tool call pending' : 'Tool call succeeded'}
+                >
+                  <div>{iconForToolCall(toolCall)}</div>
+                  <div>{toolCall.tagline}</div>
+                  {isExpandable(toolCall) && (
+                    <div>
+                      {expandedToolCalls.includes(toolCall.id) ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </div>
+                  )}
+                </div>
+                {toolCall.code && expandedToolCalls.includes(toolCall.id) && (
                   <div>
-                    {expandedToolCalls.includes(toolCall.id) ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    <pre className="text-left bg-gray-800 rounded text-xs overflow-x-scroll">
+                      <SyntaxHighlighter
+                        language={toolCall.code.language}
+                        style={dark}
+                        className="rounded border-gray-500 border bg-slate-900!"
+                      >
+                        {toolCall.code.code}
+                      </SyntaxHighlighter>
+                    </pre>
+                  </div>
+                )}
+                {toolCall.table && expandedToolCalls.includes(toolCall.id) && (
+                  <div className="text-left bg-slate-900 border-gray-500 border rounded text-xs overflow-x-scroll">
+                    <table className="w-full border-collapse">
+                      <tbody>
+                        {Object.entries(toolCall.table).map(([key, value], index, array) => (
+                          <tr key={key} className={index < array.length - 1 ? 'border-b border-gray-600' : ''}>
+                            <td className="px-2 py-1 font-medium text-gray-300">{key}</td>
+                            <td className="px-2 py-1 text-white">{value}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
               </div>
-              {toolCall.code && expandedToolCalls.includes(toolCall.id) && (
-                <div>
-                  <pre className="text-left bg-gray-800 rounded text-xs overflow-x-scroll">
-                    <SyntaxHighlighter
-                      language={toolCall.code.language}
-                      style={dark}
-                      className="rounded border-gray-500 border bg-slate-900!"
-                    >
-                      {toolCall.code.code}
-                    </SyntaxHighlighter>
-                  </pre>
-                </div>
-              )}
-              {toolCall.table && expandedToolCalls.includes(toolCall.id) && (
-                <div className="text-left bg-slate-900 border-gray-500 border rounded text-xs overflow-x-scroll">
-                  <table className="w-full border-collapse">
-                    <tbody>
-                      {Object.entries(toolCall.table).map(([key, value], index, array) => (
-                        <tr key={key} className={index < array.length - 1 ? 'border-b border-gray-600' : ''}>
-                          <td className="px-2 py-1 font-medium text-gray-300">{key}</td>
-                          <td className="px-2 py-1 text-white">{value}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </>

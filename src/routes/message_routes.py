@@ -46,7 +46,7 @@ from openai.types.chat.chat_completion_system_message_param import (
 from openai.types.chat.chat_completion_message_param import (
     ChatCompletionMessageParam,
 )
-from openai.types.chat import ChatCompletionMessageToolCallParam
+from openai.types.chat import ChatCompletionMessageToolCall
 from openai import APIError
 
 from src.symbology.llm import generate_maplibre_layers_for_layer_id
@@ -101,8 +101,12 @@ from src.database.models import (
     MapLayer,
     Conversation,
 )
-from src.openstreetmap import download_from_openstreetmap, has_openstreetmap_api_key
 from src.routes.websocket import kue_ephemeral_action, kue_notify_error
+from src.tools.pyd import tool_from as tool_from_pyd
+from src.dependencies.pydantic_tools import (
+    get_pydantic_tool_calls,
+    PydanticToolRegistry,
+)
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
@@ -686,6 +690,7 @@ async def process_chat_interaction_task(
     conversation: Conversation,
     system_prompt_provider: SystemPromptProvider,
     connection_manager: PostgresConnectionManager,
+    pydantic_tool_calls: PydanticToolRegistry,
 ):
     # kick it off with a quick sleep, to detach from the event loop blocking /send
     await asyncio.sleep(0.1)
@@ -772,7 +777,7 @@ async def process_chat_interaction_task(
                                     },
                                     "query": {
                                         "type": "string",
-                                        "description": "SQL query to execute against PostGIS database for this layer, should list fetched columns for attributes that might be used for symbology (+ shape geometry). This query MUST alias the geometry column as 'geom'. Include newlines+spaces at ~55 column wrap",
+                                        "description": "SQL query to execute against PostGIS database for this layer, should list fetched columns for attributes that might be used for symbology (+ shape geometry). This query MUST alias the geometry column as 'geom' AND have a unique numeric id aliased as 'id'. Include newlines+spaces at ~55 column wrap",
                                     },
                                     "layer_name": {
                                         "type": "string",
@@ -883,70 +888,11 @@ async def process_chat_interaction_task(
                             },
                         },
                     },
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "zoom_to_bounds",
-                            "description": "Zoom the map to a specific bounding box in WGS84 coordinates. This will save the user's current zoom location to history and navigate to the new bounds.",
-                            "strict": True,
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "bounds": {
-                                        "type": "array",
-                                        "description": "Bounding box in WGS84 format [xmin, ymin, xmax, ymax]",
-                                        "items": {"type": "number"},
-                                        "minItems": 4,
-                                        "maxItems": 4,
-                                    },
-                                    "zoom_description": {
-                                        "type": "string",
-                                        "description": 'Complete message to display to the user while zooming, e.g. "Zooming to 39 selected parcels near Ohio"',
-                                    },
-                                },
-                                "required": ["bounds", "zoom_description"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
                 ]
 
-                # Conditionally add OpenStreetMap tool if API key is configured
-                if has_openstreetmap_api_key():
-                    tools_payload.append(
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "download_from_openstreetmap",
-                                "description": "Download features from OSM and add to project as a cloud FlatGeobuf layer",
-                                "strict": True,
-                                "parameters": {
-                                    "type": "object",
-                                    "required": [
-                                        "tags",
-                                        "bbox",
-                                        "new_layer_name",
-                                    ],
-                                    "properties": {
-                                        "tags": {
-                                            "type": "string",
-                                            "description": "Tags to filter for e.g. leisure=park, use & to AND tags together e.g. highway=footway&name=*, no commas",
-                                        },
-                                        "bbox": {
-                                            "type": "array",
-                                            "description": "Bounding box in [xmin, ymin, xmax, ymax] format e.g. [9.023802,39.172149,9.280779,39.275211] for Cagliari, Italy",
-                                            "items": {"type": "number"},
-                                        },
-                                        "new_layer_name": {
-                                            "type": "string",
-                                            "description": "Human-friendly name e.g. Walking paths or Liquor stores in Seattle",
-                                        },
-                                    },
-                                    "additionalProperties": False,
-                                },
-                            },
-                        }
-                    )
+                # add pydantic-defined tools to the payload
+                for name, (fn, arg_model, _mundi_model) in pydantic_tool_calls.items():
+                    tools_payload.append(tool_from_pyd(fn, arg_model))
 
                 all_tools = get_tools()
                 tools_payload.extend(all_tools)
@@ -1034,11 +980,67 @@ async def process_chat_interaction_task(
                 if not assistant_message.tool_calls:
                     break
 
+                # Fetch project_id for this map once for all tool calls
+                async with async_conn("tool.project_id_for_map") as proj_conn:
+                    row = await proj_conn.fetchrow(
+                        "SELECT project_id FROM user_mundiai_maps WHERE id = $1",
+                        map_id,
+                    )
+                    assert row is not None
+                    current_project_id: str = row["project_id"]
+
+                # Process each tool call returned by the assistant
+
                 for tool_call in assistant_message.tool_calls:
-                    tool_call: ChatCompletionMessageToolCallParam = tool_call
+                    tool_call: ChatCompletionMessageToolCall = tool_call
                     function_name = tool_call.function.name
                     tool_args = json.loads(tool_call.function.arguments)
                     tool_result = {}
+
+                    if function_name in pydantic_tool_calls:
+                        fn, ArgModel, MundiModel = pydantic_tool_calls[function_name]
+                        try:
+                            parsed_args = ArgModel(**(tool_args or {}))
+
+                        except Exception as e:
+                            tool_result = {
+                                "status": "error",
+                                "error": f"Invalid arguments for {function_name}: {e}",
+                            }
+                            await add_chat_completion_message(
+                                ChatCompletionToolMessageParam(
+                                    role="tool",
+                                    tool_call_id=tool_call.id,
+                                    content=json.dumps(tool_result),
+                                ),
+                            )
+                            continue
+
+                        try:
+                            mundi_args = MundiModel(
+                                user_uuid=user_id,
+                                conversation_id=conversation.id,
+                                map_id=map_id,
+                                project_id=current_project_id,
+                                session=session,
+                            )
+                            # Execute tool (all tools are async)
+                            tool_result = await fn(parsed_args, mundi_args)
+
+                        except Exception:
+                            tool_result = {
+                                "status": "error",
+                                "error": "Tool execution failed. Please try again or adjust the inputs.",
+                            }
+
+                        await add_chat_completion_message(
+                            ChatCompletionToolMessageParam(
+                                role="tool",
+                                tool_call_id=tool_call.id,
+                                content=json.dumps(tool_result),
+                            ),
+                        )
+                        continue
 
                     span.add_event(
                         "kue.tool_call_started",
@@ -1572,62 +1574,6 @@ async def process_chat_interaction_task(
                                     content=json.dumps(tool_result),
                                 ),
                             )
-                        elif function_name == "download_from_openstreetmap":
-                            tags = tool_args.get("tags")
-                            bbox = tool_args.get("bbox")
-                            new_layer_name = tool_args.get("new_layer_name")
-
-                            if not all([tags, bbox, new_layer_name]):
-                                tool_result = {
-                                    "status": "error",
-                                    "error": "Missing required parameters for OpenStreetMap download.",
-                                }
-                            else:
-                                try:
-                                    # Keep context manager only around the specific API call
-                                    async with kue_ephemeral_action(
-                                        conversation.id,
-                                        f"Downloading data from OpenStreetMap: {tags}",
-                                    ):
-                                        tool_result = await download_from_openstreetmap(
-                                            map_id=map_id,
-                                            bbox=bbox,
-                                            tags=tags,
-                                            new_layer_name=new_layer_name,
-                                            session=session,
-                                        )
-                                except Exception as e:
-                                    print(traceback.format_exc())
-                                    print(e)
-                                    tool_result = {
-                                        "status": "error",
-                                        "error": f"Error downloading from OpenStreetMap: {str(e)}",
-                                    }
-                            # Add instructions to tool result if download was successful
-                            if tool_result.get(
-                                "status"
-                            ) == "success" and tool_result.get("uploaded_layers"):
-                                uploaded_layers = tool_result.get("uploaded_layers")
-                                layer_names = [
-                                    f"{new_layer_name}_{layer['geometry_type']}"
-                                    for layer in uploaded_layers
-                                ]
-                                layer_ids = [
-                                    layer["layer_id"] for layer in uploaded_layers
-                                ]
-                                tool_result["kue_instructions"] = (
-                                    f"New layers available: {', '.join(layer_names)} "
-                                    f"(IDs: {', '.join(layer_ids)}), all currently invisible. "
-                                    'To make any of these visible to the user on their map, use "add_layer_to_map" with the layer_id and a descriptive new_name.'
-                                )
-
-                            await add_chat_completion_message(
-                                ChatCompletionToolMessageParam(
-                                    role="tool",
-                                    tool_call_id=tool_call.id,
-                                    content=json.dumps(tool_result),
-                                ),
-                            )
                         elif function_name == "query_postgis_database":
                             postgis_connection_id = tool_args.get(
                                 "postgis_connection_id"
@@ -1789,73 +1735,7 @@ async def process_chat_interaction_task(
                                     content=json.dumps(tool_result),
                                 ),
                             )
-                        elif function_name == "zoom_to_bounds":
-                            bounds = tool_args.get("bounds")
-                            description = tool_args.get("zoom_description", "")
 
-                            if not bounds or len(bounds) != 4:
-                                tool_result = {
-                                    "status": "error",
-                                    "error": "Invalid bounds. Must be an array of 4 numbers [west, south, east, north]",
-                                }
-                            else:
-                                try:
-                                    # Validate bounds format
-                                    west, south, east, north = bounds
-                                    if not all(
-                                        isinstance(coord, (int, float))
-                                        for coord in bounds
-                                    ):
-                                        raise ValueError(
-                                            "All bounds coordinates must be numbers"
-                                        )
-
-                                    if west >= east or south >= north:
-                                        raise ValueError(
-                                            "Invalid bounds: west must be < east and south must be < north"
-                                        )
-
-                                    if not (
-                                        -180 <= west <= 180
-                                        and -180 <= east <= 180
-                                        and -90 <= south <= 90
-                                        and -90 <= north <= 90
-                                    ):
-                                        raise ValueError(
-                                            "Bounds must be in valid WGS84 range"
-                                        )
-
-                                    # Send ephemeral action to trigger zoom on frontend
-                                    async with kue_ephemeral_action(
-                                        conversation.id,
-                                        description,
-                                        update_style_json=False,
-                                        bounds=bounds,
-                                    ):
-                                        await asyncio.sleep(0.5)
-
-                                    tool_result = {
-                                        "status": "success",
-                                        "bounds": bounds,
-                                    }
-                                except ValueError as e:
-                                    tool_result = {
-                                        "status": "error",
-                                        "error": str(e),
-                                    }
-                                except Exception as e:
-                                    tool_result = {
-                                        "status": "error",
-                                        "error": f"Error zooming to bounds: {str(e)}",
-                                    }
-
-                            await add_chat_completion_message(
-                                ChatCompletionToolMessageParam(
-                                    role="tool",
-                                    tool_call_id=tool_call.id,
-                                    content=json.dumps(tool_result),
-                                ),
-                            )
                         elif function_name in geoprocessing_function_names:
                             tool_result = await run_geoprocessing_tool(
                                 tool_call,
@@ -1917,6 +1797,7 @@ async def send_map_message(
     connection_manager: PostgresConnectionManager = Depends(
         get_postgres_connection_manager
     ),
+    pydantic_tool_calls: PydanticToolRegistry = Depends(get_pydantic_tool_calls),
 ):
     # get_conversation authenticates
     user_id = session.get_user_id()
@@ -2003,6 +1884,7 @@ async def send_map_message(
             conversation,
             system_prompt_provider,
             connection_manager,
+            pydantic_tool_calls,
         )
     else:
         background_tasks.add_task(
@@ -2016,6 +1898,7 @@ async def send_map_message(
             conversation,
             system_prompt_provider,
             connection_manager,
+            pydantic_tool_calls,
         )
 
     return MessageSendResponse(

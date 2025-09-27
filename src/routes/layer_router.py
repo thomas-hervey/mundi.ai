@@ -55,6 +55,9 @@ from src.dependencies.layer_describer import LayerDescriber, get_layer_describer
 from opentelemetry import trace
 from src.dependencies.base_map import get_base_map_provider
 from src.utils import generate_id
+from boto3.s3.transfer import TransferConfig
+
+one_shot_config = TransferConfig(multipart_threshold=5 * 1024**3)  # 5 GiB
 
 # Global semaphore to limit concurrent social image renderings
 # This prevents OOM issues when many maps load simultaneously
@@ -107,7 +110,7 @@ async def get_layer_cog_tif(
             if not acquired:
                 raise HTTPException(
                     status_code=423,
-                    detail="COG generation in progress. Try again later.",
+                    detail="COG generation in progress. Please refresh in a moment. This will take 2-3 minutes.",
                 )
             try:
                 row = await conn.fetchrow(
@@ -263,7 +266,9 @@ async def get_layer_cog_tif(
                         # Upload the COG file to S3
                         cog_key = f"cog/layer/{layer.layer_id}.cog.tif"
                         s3 = await get_async_s3_client()
-                        await s3.upload_file(local_cog_file, bucket_name, cog_key)
+                        await s3.upload_file(
+                            local_cog_file, bucket_name, cog_key, Config=one_shot_config
+                        )
 
                         # Update the layer metadata with the COG key
                         metadata = layer.metadata_dict or {}
@@ -397,11 +402,11 @@ async def get_layer_pmtiles(
     # Check if metadata has pmtiles_key
     pmtiles_key = layer.metadata_dict.get("pmtiles_key")
 
-    # If PMTiles doesn't exist, create it
+    # If PMTiles doesn't exist, inform client it's still generating (4xx so frontend surfaces it)
     if not pmtiles_key:
         raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="Vector tiles for this layer have not been generated yet",
+            status_code=status.HTTP_423_LOCKED,
+            detail="Vector tiles are still generating. Please refresh in a moment. This will take 2-3 minutes.",
         )
 
     # Get the file size first to handle range requests using async S3
@@ -607,10 +612,7 @@ async def get_raster_xyz_tile(
                 min_val = metadata["raster_value_stats_b1"]["min"]
                 max_val = metadata["raster_value_stats_b1"]["max"]
 
-                img.rescale(
-                    in_range=((min_val, max_val),),
-                    out_range=((0, 255),)
-                )
+                img.rescale(in_range=((min_val, max_val),), out_range=((0, 255),))
 
                 cm = cmap.get("spectral_r")
                 content = img.render(img_format="PNG", colormap=cm)
