@@ -36,7 +36,7 @@ services:
       - QGIS_PROCESSING_URL=http://qgis-processing:8817
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - OPENAI_API_KEY=$OPENAI_API_KEY
+      # - OPENAI_API_KEY=$OPENAI_API_KEY
       - POSTGRES_HOST=postgresdb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=mundidb
@@ -45,12 +45,14 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONIOENCODING=utf-8
       - POSTGIS_LOCALHOST_POLICY=docker_rewrite
-      # - OPENAI_BASE_URL=http://host.docker.internal:11434/v1
-      # - OPENAI_API_KEY=ollama
-      # - OPENAI_MODEL=orieg/gemma3-tools:1b
-      #-  MUNDI_EMBED_ALLOWED_ORIGINS=http://localhost:4321
-      # extra_hosts:
-      #   - "host.docker.internal:host-gateway"
+
+      # NOTE: TAH – The following are used (and replace the 'OPENAI_API_KEY' above) to connect to Ollama running locally (https://docs.mundi.ai/deployments/connecting-to-local-llm-with-ollama/)
+      - OPENAI_BASE_URL=http://host.docker.internal:11434/v1
+      - OPENAI_API_KEY=ollama
+      - OPENAI_MODEL=orieg/gemma3-tools:1b
+      - MUNDI_EMBED_ALLOWED_ORIGINS=http://localhost:4321
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: uvicorn src.wsgi:app --host 0.0.0.0 --port 8000 --log-level debug --access-log --use-colors
     volumes:
       - ./src:/app/src
